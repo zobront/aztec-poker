@@ -3,35 +3,25 @@
 contract Poker {
     // use dep::...
 
-    // struct Storage {
+    struct Storage {
     //     // game_id => game data
     //     games: Map<PublicState<Game, GAME_SERIALIZED_LEN>>,
     //     // game_id => private (challenger) throw
     //     privateThrows: Map<ImmutableSingleton<ThrowNote, THROW_NOTE_LEN>>,
-    //     // address => games won
-    //     wins: Map<PublicState<Field, FIELD_SERIALIZED_LEN>>,
-    //     // address => games lost
-    //     losses: Map<PublicState<Field, FIELD_SERIALIZED_LEN>>
-    // }
+    }
 
-    // impl Storage {
-    //     fn init(context: Context) -> pub Self {
-    //         Storage {
+    impl Storage {
+        fn init(context: Context) -> pub Self {
+            Storage {
     //             games: Map::new(context, 1, |context, slot| {
     //                 PublicState::new(context, slot, GameMethods)
     //             }),
     //             privateThrows: Map::new(context, 2, |context, slot| {
     //                 ImmutableSingleton::new(context, slot, ThrowNoteMethods)
-    //             }),
-    //             wins: Map::new(context, 3, |context, slot| {
-    //                 PublicState::new(context, slot, FieldSerializationMethods)
-    //             }),
-    //             losses: Map::new(context, 4, |context, slot| {
-    //                 PublicState::new(context, slot, FieldSerializationMethods)
     //             })
-    //         }
-    //     }
-    // }
+            }
+        }
+    }
 
     ////////////////////////////////
     ////// EXTERNAL FUNCTIONS //////
@@ -50,12 +40,13 @@ contract Poker {
         // can specify other player or not
         // can specify stakes & timeout
         // i think table id should be hash of both players plus a nonce, so add nonce as well
+        // put chips on table (into usdp with table id verification and balances tracked here?)
     }
 
     #[aztec(public)]
     fn join_table() {
         // for tables that don't have a P2, join and set themselves as P2
-        // players with P2 specified are implicitly started automatically?
+        // put chips on table (need this because otherwise could double spend in two games)
     }
 
     ////////////////////////////////
@@ -167,13 +158,11 @@ contract Poker {
     ////////////////////////////////
 
     #[aztec(public)]
-    fn flag_timeout() {
+    fn timeout() {
         // require(phase check should be other player's turn)
         // require(timeout has passed since last move)
         // claim the pot and end the hand
     }
-
-
 
     ////////////////////////////////
     ////// INTERNAL FUNCTIONS //////
