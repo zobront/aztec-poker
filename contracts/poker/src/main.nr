@@ -1,5 +1,5 @@
 mod table;
-mod hand;
+mod deck;
 
 contract Poker {
     use dep::std::option::Option;
@@ -23,7 +23,8 @@ contract Poker {
         selector::compute_selector
     };
     use crate::{
-        table::{Table, TableOptions, TableMethods, TABLE_SERIALIZED_LEN}
+        table::{Table, TableOptions, TableMethods, TABLE_SERIALIZED_LEN},
+        deck::Deck
     };
 
 
@@ -32,7 +33,9 @@ contract Poker {
         // tableid = hash(creator, options, nonce) => table
         tables: Map<PublicState<Table, TABLE_SERIALIZED_LEN>>
         // tableid = hash(creator, options, nonce) => private shuffled deck
-        deck: Map<Singleton<Deck, DECK_SERIALIZED_LEN>>
+        deck: Map<Singleton<Deck, DECK_SERIALIZED_LEN>>,
+        // total rake available for withdrawal
+        fees: Field
     }
 
     impl Storage {
@@ -43,7 +46,8 @@ contract Poker {
                 }),
                 deck: Map::new(context, 2, |context, slot| {
                     Singleton::new(context, slot, DeckMethods)
-                })
+                }),
+                fees: PublicState::new(context, 3, FieldSerializationMethods)
             }
         }
     }
@@ -91,14 +95,9 @@ contract Poker {
     ////////////////////////////////
 
     #[aztec(private)]
-    fn dealer_shuffle(table_id: Field, deck: [Field; 52]) {
+    fn dealer_shuffle(table_id: Field, deck: Deck) {
         // prove that deck has one of every card (inputted as plaintext)
-        let mut used = [0; false];
-        for card in deck {
-            assert(card as u32 < 52);
-            asssert(!used[card]);
-            used[card] = true;
-        }
+        deck.validate_deck();
 
         // @todo encrypt each card with dealer's private key
         // - this can use their aztec secret key if el gamel has grumpking
@@ -121,37 +120,23 @@ contract Poker {
     internal fn dealer_shuffle_backend(table_id: Field) {
         let mut table = storage.tables.at(table_id).read();
         table.validate_caller(caller, true);
-        table.validate_and_increment_phase(0); // from 0 to 1
+        table.hand.validate_and_shift_phase([0], 1, context.block_timestamp());
         storage.tables.at(table_id).write(table);
     }
 
     #[aztec(private)]
-    fn player_shuffle(table_id: Field, shuffle_array: [Field; 52]) {
+    fn player_shuffle(table_id: Field, shuffle_array: Deck) {
         // @todo pull old_deck directly from private state
         let old_deck = storage.deck.at(table_id).read();
 
         // confirm that the shuffle array contains one of each number 0-51
-        let mut used = [false; 52];
-        for i in shuffle_array {
-            assert(i as u32 < 52);
-            asssert(!used[i]);
-            used[i] = true;
-        }
+        shuffle_array.validate_deck();
 
         // set new_deck[i] to the card at position shuffle_array[i] in the old deck
         let mut new_deck = [0; 52];
         for i in 0..52 {
             new_deck[i] = old_deck[shuffle_array[i]];
         }
-
-        // // OLD IMPLEMENTATION:
-        // // if the sorted version of each deck is identical
-        // // then we know new_deck is a valid shuffle of old_deck
-        // let old_sorted = old_deck.sort();
-        // let new_sorted = new_deck.sort();
-        // for i in 0..52 {
-        //     assert(old_sorted[i] == new_sorted[i]);
-        // }
 
         // @todo encrypt each with player's private key
         let encrypted_deck = new_deck
@@ -173,36 +158,14 @@ contract Poker {
     ) {
         let mut table = storage.tables.at(table_id).read();
         table.validate_caller(caller, false);
-        table.validate_and_increment_phase(1); // from 1 to 2
+        table.hand.validate_and_shift_phase([1], 1, context.block_timestamp());
 
         table.hand.dealer_cards = dealer_cards; // already unencrypted for dealer
         table.hand.player_cards = player_cards; // double encrypted
         table.hand.table_cards = table_cards; // double encrypted
 
-        storage.tables.at(table_id).write(table);
-    }
+        table.place_blinds();
 
-
-
-    #[aztec(private)]
-    fn deal_cards(table_id: Field, player_cards: [Field; 2]) {
-        // @todo decrypt cards
-        let decrypted cards = player_cards;
-
-        // initiate public state checks and updated
-        context.call_public_function(
-            compute_selector("deal_cards_backend(Field,[Field;2])"),
-            [table_id, AztecAddress::new(context.msg_sender()), decrypted_cards]
-        )
-    }
-
-    #[aztec(public)]
-    fn deal_cards_backend(table_id: Field, caller: AztecAddress, players_cards: [Field; 2]) {
-        let table = storage.tables.at(table_id).read();
-        table.validate_caller(caller, true);
-        table.validate_and_increment_phase(2); // from 2 to 3
-
-        table.hand.player_cards = players_cards; // unencrypt for player
         storage.tables.at(table_id).write(table);
     }
 
@@ -210,75 +173,69 @@ contract Poker {
     ///////// TABLE CARDS //////////
     ////////////////////////////////
 
-    // @todo can i merge these into one function with generics? or at least merge backends?
-    // same with deal_cards above, and maybe even player showdown? all same pattern
-
     #[aztec(private)]
-    fn deal_flop(table_id: Field, encrypted_cards: [Field; 3]) {
+    fn deal_cards(table_id: Field, encrypted_cards: [Field; 3]) {
         // @todo decrypt cards
+        // - skip any that are zero and just pass zero
         let decrypted_cards = encrypted_cards;
 
         // initiate public state checks and updated
         context.call_public_function(
-            compute_selector("deal_flop_backend(Field,[Field;3])"),
+            compute_selector("deal_cards_backend(Field,Field,[Field;3],[Field;3])"),
             [table_id, AztecAddress::new(context.msg_sender()), encrypted_cards, decrypted_cards]
         )
     }
 
     #[aztec(public)]
-    internal fn deal_flop_backend(table_id: Field, caller: AztecAddress, encrypted_flop: [Field; 3], decrypted_flop: [Field; 3]) {
-        let mut table = storage.tables.at(table_id).read();
-        assert(table.hand.table_cards[:3] == encrypted_flop);
+    internal fn deal_cards_backend(table_id: Field, caller: AztecAddress, encrypted_cards: [Field; 3], decrypted_cards: [Field; 3]) {
+        let table = storage.tables.at(table_id).read();
+        let phase = table.hand.phase;
 
-        if table.hand.next_phase.phase == 5 {
+        if phase == 2 {
+            // dealer is passing hand cards to player
             table.validate_caller(caller, true);
-
-        } else if table.hand.next_phase.phase == 6 {
+            assert(table.hand.player_cards == encrypted_cards[:2]);
+            table.hand.player_cards = decrypted_cards[:2];
+        } else if phase == 5 {
+            // dealer is dealing flop cards
+            table.validate_caller(caller, true);
+            assert(table.hand.table_cards[:3] == encrypted_cards);
+            table.hand.table_cards[:3] = decrypted_cards;
+        } else if phase == 6 {
+            // player is revealing flop cards
             table.validate_caller(caller, false);
+            assert(table.hand.table_cards[:3] == encrypted_cards);
+            table.hand.table_cards[:3] = decrypted_cards;
+        } else if phase == 9 {
+            // dealer is dealing turn card
+            table.validate_caller(caller, true);
+            assert(table.hand.table_cards[3] == encrypted_cards[0]);
+            table.hand.table_cards[3] = decrypted_cards[0];
+        } else if phase == 10 {
+            // player is revealing turn card
+            table.validate_caller(caller, false);
+            assert(table.hand.table_cards[3] == encrypted_cards[0]);
+            table.hand.table_cards[3] = decrypted_cards[0];
+        } else if phase == 13 {
+            // dealer is dealing river card
+            table.validate_caller(caller, true);
+            assert(table.hand.table_cards[4] == encrypted_cards[0]);
+            table.hand.table_cards[4] = decrypted_cards[0];
+        } else if phase == 14 {
+            // player is revealing river card
+            table.validate_caller(caller, false);
+            assert(table.hand.table_cards[4] == encrypted_cards[0]);
+            table.hand.table_cards[4] = decrypted_cards[0];
+        } else if phase == 17 {
+            // player is showing hand
+            table.validate_caller(caller, false);
+            assert(table.hand.player_cards == encrypted_cards[:2]);
+            table.hand.player_cards = decrypted_cards[:2];
         } else {
             assert(false);
         }
-        table.hand.next_phase.phase += 1; // from 5 to 6 or 6 to 7
 
-        table.hand.table_cards[:3] = decrypted_flop; // unencrypt for player
-
-        storage.tables.at(table_id).write(table);
-    }
-
-    #[aztec(private)]
-    fn deal_turn_or_river(table_id: Field, encrypted_card: Field) {
-        // @todo decrypt card
-        let decrypted_card = encrypted_card;
-
-        // initiate public state checks and updated
-        context.call_public_function(
-            compute_selector("deal_turn_or_river_backend(Field,Field,Field,Field)"),
-            [table_id, AztecAddress::new(context.msg_sender()), encrypted_card, decrypted_card]
-        )
-    }
-
-    #[aztec(public)]
-    internal fn deal_turn_or_river_backend(table_id: Field, caller: AztecAddress, encrypted_card: Field, decrypted_card: Field) {
-        let mut table = storage.tables.at(table_id).read();
-        let phase = table.hand.next_phase.phase;
-
-        if phase == 9 || phase == 10 {
-            assert(table.hand.table_cards[4] == encrypted_card);
-            table.hand.table_cards[4] = decrypted_card;
-        } else if phase == 13 || phase == 14 {
-            assert(table.hand.table_cards[5] == encrypted_card);
-            table.hand.table_cards[5] = decrypted_card;
-        } else {
-            assert(false);
-        }
-
-        if phase == 9 || phase == 13 {
-            table.validate_caller(caller, true);
-        } else if phase == 10 || phase == 14 {
-            table.validate_caller(caller, false);
-        }
-
-        table.hand.next_phase.phase += 1; // from 5 to 6 or 6 to 7
+        table.hand.shift_phase(1, context.block_timestamp());
         storage.tables.at(table_id).write(table);
     }
 
@@ -287,36 +244,34 @@ contract Poker {
     ////////////////////////////////
 
     #[aztec(private)]
-    fn showdown(table_id: Field, hand: [Field; 2]) {
+    fn showdown(table_id: Field, encrypted_hand: [Field; 2]) {
         // @todo decrypt hand
-        let decrypted_hand = hand;
+        let decrypted_hand = encrypted_hand;
 
         // initiate public state checks and updated
         context.call_public_function(
-            compute_selector("player_showdown_backend(Field,[Field;2],[Field;2])"),
-            [table_id, AztecAddress::new(context.msg_sender()), decrypted_hand, encrypted_hand]
+            compute_selector("showdown_backend(Field,[Field;2],[Field;2])"),
+            [table_id, AztecAddress::new(context.msg_sender()), encrypted_hand, decrypted_hand]
         )
     }
 
     #[aztec(public)]
-    internal fn showdown_backend(table_id: Field, caller: AztecAddress, decrypted_hand: [Field; 2], encrypted_hand: [Field; 2]) {
+    internal fn showdown_backend(table_id: Field, caller: AztecAddress, encrypted_hand: [Field; 2], decrypted_hand: [Field; 2]) {
         let mut table = storage.tables.at(table_id).read();
-        assert(table.hand.player_cards == encrypted_hand);
 
-        if table.hand.next_phase.phase == 17 {
-            table.validate_caller(caller, false);
-            table.hand.player_cards = decrypted_hand; // unencrypt for player
-        } else if table.hand.next_phase.phase == 18 {
-            table.validate_caller(caller, true);
-            table.hand.dealer_cards = decrypted_hand; // unencrypt for player
+        table.validate_caller(caller, true);
+        table.hand.validate_phase(18);
+        assert(table.hand.dealer_cards == encrypted_hand);
 
-            // @todo determine who won, settle up the pot, reset the hand
-            // maybe game holds hand storage so we can call game.end_hand() and it can call hand.reset()
-        } else {
-            assert(false);
-        }
+        // @todo determine who won
+        // 0 = p0, 1 = p1, 2 = tie
 
-        table.hand.next_phase.phase += 1; // from 18 to 19
+        // send pot back into player's stacks
+        let fees = table.send_winnings_and_return_fees(winner);
+        storage.fees.write(storage.fees.read() + fees);
+
+        // reset to prepare for fresh hand
+        table.next_hand();
         storage.tables.at(table_id).write(table);
     }
 
@@ -352,19 +307,11 @@ contract Poker {
             assert(false);
         }
 
-        // if caller is dealer, it must be dealer's turn to bet
-        // after the dealer bets, it moves backwards to the player bet
-        // note, this can only happen after a check from the player
+        // validate we are in a phase for this caller and shift to next phase
         if caller_is_dealer {
-            // @todo implement that this can take arrays of options
-            table.validate_phase([4, 8, 12, 16]);
-            table.hand.next_phase.phase -= 1;
-
-        // if caller is player, it must be player's turn to bet
-        // after the player bets, it moves forward to the dealer's bet
+            table.hand.validate_and_shift_phase([4, 8, 12, 16], 18, context.block_timestamp());
         } else {
-            table.validate_phase([3, 7, 11, 15]);
-            table.hand.next_phase.phase += 1;
+            table.hand.validate_and_shift_phase([3, 7, 11, 15], 1, context.block_timestamp());
         }
 
         // move tokens from the correct player's stack to their pot
@@ -407,19 +354,13 @@ contract Poker {
             assert(false);
         }
 
-        // if caller is dealer, it must be dealer's turn to bet
-        // after the dealer checks, it moves forward to next phase
+        // validate we are in a phase for this caller and shift to next phase
         if caller_is_dealer {
-            table.validate_phase([4, 8, 12, 16]);
-
-        // if caller is player, it must be player's turn to bet
-        // after the player checks, it moves forward to the dealer's turn
+            table.hand.validate_and_shift_phase([4, 8, 12, 16], 1, context.block_timestamp());
         } else {
-            table.validate_phase([3, 7, 11, 15]);
+            table.hand.validate_and_shift_phase([3, 7, 11, 15], 1, context.block_timestamp());
         }
 
-        // progress to next phase and update storage
-        table.hand.next_phase.phase += 1;
         storage.tables.at(table_id).write(table);
     }
 
@@ -449,15 +390,12 @@ contract Poker {
         // if caller is dealer, it means the player bet
         // if the dealer calls, we move forward to the next phase
         if caller_is_dealer {
-            // @todo implement that this can take arrays of options
-            table.validate_phase([4, 8, 12, 16]);
-            table.hand.next_phase.phase += 1;
+            table.hand.validate_and_shift_phase([4, 8, 12, 16], 1, context.block_timestamp());
 
         // if caller is player, it means the dealer bet and sent it back
         // after the player calls, we skip the dealer to go to the next phase
         } else {
-            table.validate_phase([3, 7, 11, 15]);
-            table.hand.next_phase.phase += 2;
+            table.hand.validate_and_shift_phase([3, 7, 11, 15], 2, context.block_timestamp());
         }
 
         // move tokens from the correct player's stack to their pot
@@ -488,21 +426,23 @@ contract Poker {
 
         // move the pot to the opposite player
         if (caller == table.p0) {
-            table.p1_stack += (table.hand.p0_pot + table.hand.p1_pot);
+            let fees = table.send_winnings_and_return_fees(1);
+            storage.fees.write(storage.fees.read() + fees);
         } else if (caller == table.p1) {
-            table.p0_stack += (table.hand.p0_pot + table.hand.p1_pot);
+            let fees = table.send_winnings_and_return_fees(0);
+            storage.fees.write(storage.fees.read() + fees);
         } else {
             assert(false);
         }
 
-        // @todo should reset phase, pots, etc.
-        table.hand.reset();
+        // reset to prepare for fresh hand
+        table.next_hand();
         storage.tables.at(table_id).write(table);
     }
 
-    // bet_size is the total bet, including the call, not just the raise money
+    // raise_size is the just raise amount, which is added to call amount
     #[aztec(public)]
-    fn raise(table_id: Field, bet_size: Field) {
+    fn raise(table_id: Field, raise_size: Field) {
         let table = storage.tables.at(table_id).read();
         let caller = AztecAddress::new(context.msg_sender());
 
@@ -524,35 +464,27 @@ contract Poker {
             assert(false);
         }
 
-        // if caller is dealer, it must be dealer's turn to bet
-        // after the dealer bets, it moves backwards to the player bet
-        // note, this can only happen after a check from the player
         if caller_is_dealer {
-            // @todo implement that this can take arrays of options
-            table.validate_phase([4, 8, 12, 16]);
-            table.hand.next_phase.phase -= 1;
-
-        // if caller is player, it must be player's turn to bet
-        // after the player bets, it moves forward to the dealer's bet
+            // if caller is dealer, it must be dealer's turn to bet
+            // after the dealer bets, it moves backwards to the player bet (+ 18 mod 19 == -1)
+            // note, this can only happen after a check from the player
+            table.hand.validate_and_shift_phase([4, 8, 12, 16], 18, context.block_timestamp());
         } else {
-            table.validate_phase([3, 7, 11, 15]);
-            table.hand.next_phase.phase += 1;
+            // if caller is player, it must be player's turn to bet
+            // after the player bets, it moves forward to the dealer's bet
+            table.hand.validate_and_shift_phase([3, 7, 11, 15], 1, context.block_timestamp());
         }
 
         // move tokens from the correct player's stack to their pot
         if caller_is_p0 {
             // other player should always have a bigger pot, underflow check
             let call_size = table.hand.p1_pot - table.hand.p0_pot;
-            assert(bet_size > call_size);
-
-            table.p0_stack -= bet_size;
-            table.hand.p0_pot += bet_size;
+            table.p0_stack -= (call_size + raise_size);
+            table.hand.p0_pot += (call_size + raise_size);
         } else {
             let call_size = table.hand.p0_pot - table.hand.p1_pot;
-            assert(bet_size > call_size);
-
-            table.p1_stack -= bet_size;
-            table.hand.p1_pot += bet_size;
+            table.p1_stack -= (call_size + raise_size);
+            table.hand.p1_pot += (call_size + raise_size);
         }
         // update table storage
         storage.tables.at(table_id).write(table);
@@ -564,7 +496,43 @@ contract Poker {
 
     #[aztec(public)]
     fn timeout(table_id: Field) {
-        // require(phase check should be other player's turn)
-        // require(timeout has passed since last move)
-        // claim the pot and end the hand
+        let table = storage.tables.at(table_id).read();
+        let caller = AztecAddress::new(context.msg_sender());
+
+        // caller is one of the two players (makes rest of logic easier)
+        assert(context.block_timestamp() > table.hand.last_move_timestamp + table.timeout);
+
+        // assuming caller is p0 or p1 (checked later), check that hand is in other player's phase
+        if (table.p0_is_dealer) == (caller == table.p0) {
+            table.hand.validate_phase([1, 3, 5, 7, 9, 11, 13, 15, 17]])
+        } else {
+            table.hand.validate_phase([0, 2, 4, 6, 8, 10, 12, 14, 16, 18]);
+        }
+
+        // move the pot to self
+        if (caller == table.p0) {
+            let fees = table.send_winnings_and_return_fees(0);
+            storage.fees.write(storage.fees.read() + fees);
+        } else if (caller == table.p1) {
+            let fees = table.send_winnings_and_return_fees(1);
+            storage.fees.write(storage.fees.read() + fees);
+        } else {
+            assert(false);
+        }
+
+        table.next_hand();
+        storage.tables.at(table_id).write(table);
+    }
+
+
+    ////////////////////////////////
+    //////////// VIEW //////////////
+    ////////////////////////////////
+
+    #[aztec(public)]
+    unconstrained fn view_hand(table_id: Field) -> [Field; 2] {
+        let table = storage.tables.at(table_id).read();
+        let caller = AztecAddress::new(context.msg_sender());
+
+        // @todo grab my secret key and use it to decrypt my hand
     }
