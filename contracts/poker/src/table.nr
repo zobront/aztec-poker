@@ -112,6 +112,26 @@ impl Table {
             assert(caller.eq(self.p1));
         }
     }
+
+    pub fn validate_and_define_caller(self, caller: AztecAddress) -> (bool, bool) {
+        let mut is_p0 = false;
+        let mut is_dealer = false;
+
+        if (caller.eq(self.p0)) {
+            is_p0 = true;
+            if self.p0_is_dealer {
+                is_dealer = true;
+            }
+        } else if (caller.eq(self.p1)) {
+            if !self.p0_is_dealer {
+                is_dealer = true;
+            }
+        } else {
+            assert(false);
+        }
+
+        (is_p0, is_dealer)
+    }
 }
 
 fn deserialize(preimage: [Field; TABLE_SERIALIZED_LEN]) -> Table {

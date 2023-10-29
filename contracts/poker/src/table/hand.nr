@@ -32,6 +32,41 @@ impl Hand {
         self.shift_phase(shift, time);
     }
 
+    pub fn validate_and_shift_betting_phase(&mut self, is_dealer: bool, bet_size: Field, timestamp: Field) {
+        // check or bet
+        if (self.p0_pot == self.p1_pot) {
+            // player goes first, so will always pass to dealer
+            if !is_dealer {
+                self.validate_and_shift_phase([3, 7, 11, 15], 1, timestamp);
+            } else {
+                // if dealer checks, it progresses forward; bets passes backwards
+                if bet_size == 0 {
+                    self.validate_and_shift_phase([4, 8, 12, 16], 1, timestamp);
+                } else {
+                    self.validate_and_shift_phase([4, 8, 12, 16], 18, timestamp);
+                }
+            }
+        } else { // @audit this assumes taht if not equal, the other player's is higher - is that always true?
+            if !is_dealer {
+                if bet_size == 0 {
+                    // if player is calling, it's been passed back to them, so jump 2 to skip
+                    self.validate_and_shift_phase([3, 7, 11, 15], 2, timestamp);
+                } else {
+                    // if player is raising, they will pass turn back to dealer
+                    self.validate_and_shift_phase([3, 7, 11, 15], 1, timestamp);
+                }
+            } else {
+                if bet_size == 0 {
+                    // if dealer is calling, we move forward by 1 out of betting round
+                    self.validate_and_shift_phase([4, 8, 12, 16], 1, timestamp);
+                } else {
+                    // if dealer raises, we push backwards to the player's turn
+                    self.validate_and_shift_phase([4, 8, 12, 16], 18, timestamp);
+                }
+            }
+        }
+    }
+
     pub fn validate_phase<N>(self, phases: [Field; N]) {
         let mut found = false;
         for phase in phases {

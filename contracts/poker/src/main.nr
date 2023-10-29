@@ -279,137 +279,31 @@ contract Poker {
     /////////// BETTING ////////////
     ////////////////////////////////
 
-    // @todo TONS of repeated code here, can consolidate later
-
+    // check: bet_size = 0 when pots are equal
+    // call: bet_size = 0 when we are behind
+    // bet: bet_size > 0 when pots are equal
+    // raise: bet_size > 0 when we are behind (bet_size is the raise amount on top of call amount)
     #[aztec(public)]
     fn bet(table_id: Field, bet_size: Field) {
         let table = storage.tables.at(table_id).read();
         let caller = AztecAddress::new(context.msg_sender());
 
-        // pots should always be the same size when betting
-        assert(table.hand.p0_pot == table.hand.p1_pot);
-
         // create two variables to track if caller is p0 or p1 and dealer or not
-        // @todo is there a more elegant way to do this?
-        let caller_is_p0 = false;
-        let caller_is_dealer = false;
+        (is_po, is_dealer) = table.validate_and_define_caller(caller);
 
-        if (caller == table.p0) {
-            caller_is_p0 = true;
-            if table.dealer_is_p0 {
-                caller_is_dealer = true;
-            }
-        } else if (caller == table.p1) {
-            if !table.dealer_is_p0 {
-                caller_is_dealer = true;
-            }
-        } else {
-            assert(false);
-        }
+        // depending on dealer role and whether bet size > 0, validate we are in the correct phase
+        // shift us to the next phase for the action we're taking and set last_move_time to now
+        table.hand.validate_and_shift_betting_phase(is_dealer, bet_size, context.block_timestamp());
 
-        // validate we are in a phase for this caller and shift to next phase
-        if caller_is_dealer {
-            table.hand.validate_and_shift_phase([4, 8, 12, 16], 18, context.block_timestamp());
-        } else {
-            table.hand.validate_and_shift_phase([3, 7, 11, 15], 1, context.block_timestamp());
-        }
-
-        // move tokens from the correct player's stack to their pot
-        if caller_is_p0 {
-            table.p0_stack -= bet_size;
-            table.hand.p0_pot += bet_size;
-        } else {
-            table.p1_stack -= bet_size;
-            table.hand.p1_pot += bet_size;
-        }
-
-        // update table storage
-        storage.tables.at(table_id).write(table);
-    }
-
-    // @todo might be some duplicate logic to conslidate between this and bet
-    #[aztec(public)]
-    fn check() {
-        let table = storage.tables.at(table_id).read();
-        let caller = AztecAddress::new(context.msg_sender());
-
-        // pots should always be the same size when betting
-        assert(table.hand.p0_pot == table.hand.p1_pot);
-
-        // create two variables to track if caller is p0 or p1 and dealer or not
-        // @todo is there a more elegant way to do this?
-        let caller_is_p0 = false;
-        let caller_is_dealer = false;
-
-        if (caller == table.p0) {
-            caller_is_p0 = true;
-            if table.dealer_is_p0 {
-                caller_is_dealer = true;
-            }
-        } else if (caller == table.p1) {
-            if !table.dealer_is_p0 {
-                caller_is_dealer = true;
-            }
-        } else {
-            assert(false);
-        }
-
-        // validate we are in a phase for this caller and shift to next phase
-        if caller_is_dealer {
-            table.hand.validate_and_shift_phase([4, 8, 12, 16], 1, context.block_timestamp());
-        } else {
-            table.hand.validate_and_shift_phase([3, 7, 11, 15], 1, context.block_timestamp());
-        }
-
-        storage.tables.at(table_id).write(table);
-    }
-
-    #[aztec(public)]
-    fn call(table_id: Field) {
-        let table = storage.tables.at(table_id).read();
-        let caller = AztecAddress::new(context.msg_sender());
-
-        // create two variables to track if caller is p0 or p1 and dealer or not
-        // @todo is there a more elegant way to do this?
-        let caller_is_p0 = false;
-        let caller_is_dealer = false;
-
-        if (caller == table.p0) {
-            caller_is_p0 = true;
-            if table.dealer_is_p0 {
-                caller_is_dealer = true;
-            }
-        } else if (caller == table.p1) {
-            if !table.dealer_is_p0 {
-                caller_is_dealer = true;
-            }
-        } else {
-            assert(false);
-        }
-
-        // if caller is dealer, it means the player bet
-        // if the dealer calls, we move forward to the next phase
-        if caller_is_dealer {
-            table.hand.validate_and_shift_phase([4, 8, 12, 16], 1, context.block_timestamp());
-
-        // if caller is player, it means the dealer bet and sent it back
-        // after the player calls, we skip the dealer to go to the next phase
-        } else {
-            table.hand.validate_and_shift_phase([3, 7, 11, 15], 2, context.block_timestamp());
-        }
-
-        // move tokens from the correct player's stack to their pot
-        if caller_is_p0 {
-            // other player should always have a bigger pot, underflow check
-            let call_size = table.hand.p1_pot - table.hand.p0_pot;
-
-            // @todo implement all in logic here
-            table.p0_stack -= call_size;
-            table.hand.p0_pot += call_size;
+        // move tokens from stack to pot based on the action
+        if is_p0 {
+            let call_size = table.hand.p1_pot - table.hand.p0_pot; // positive (call, raise); zero (check, bet)
+            table.p0_stack -= (call_size + bet_size);
+            table.hand.p0_pot += (call_size + bet_size);
         } else {
             let call_size = table.hand.p0_pot - table.hand.p1_pot;
-            table.p1_stack -= call_size;
-            table.hand.p1_pot += call_size;
+            table.p1_stack -= (call_size + bet_size);;
+            table.hand.p1_pot += (call_size + bet_size);;
         }
 
         // update table storage
@@ -437,56 +331,6 @@ contract Poker {
 
         // reset to prepare for fresh hand
         table.next_hand();
-        storage.tables.at(table_id).write(table);
-    }
-
-    // raise_size is the just raise amount, which is added to call amount
-    #[aztec(public)]
-    fn raise(table_id: Field, raise_size: Field) {
-        let table = storage.tables.at(table_id).read();
-        let caller = AztecAddress::new(context.msg_sender());
-
-        // create two variables to track if caller is p0 or p1 and dealer or not
-        // @todo is there a more elegant way to do this?
-        let caller_is_p0 = false;
-        let caller_is_dealer = false;
-
-        if (caller == table.p0) {
-            caller_is_p0 = true;
-            if table.dealer_is_p0 {
-                caller_is_dealer = true;
-            }
-        } else if (caller == table.p1) {
-            if !table.dealer_is_p0 {
-                caller_is_dealer = true;
-            }
-        } else {
-            assert(false);
-        }
-
-        if caller_is_dealer {
-            // if caller is dealer, it must be dealer's turn to bet
-            // after the dealer bets, it moves backwards to the player bet (+ 18 mod 19 == -1)
-            // note, this can only happen after a check from the player
-            table.hand.validate_and_shift_phase([4, 8, 12, 16], 18, context.block_timestamp());
-        } else {
-            // if caller is player, it must be player's turn to bet
-            // after the player bets, it moves forward to the dealer's bet
-            table.hand.validate_and_shift_phase([3, 7, 11, 15], 1, context.block_timestamp());
-        }
-
-        // move tokens from the correct player's stack to their pot
-        if caller_is_p0 {
-            // other player should always have a bigger pot, underflow check
-            let call_size = table.hand.p1_pot - table.hand.p0_pot;
-            table.p0_stack -= (call_size + raise_size);
-            table.hand.p0_pot += (call_size + raise_size);
-        } else {
-            let call_size = table.hand.p0_pot - table.hand.p1_pot;
-            table.p1_stack -= (call_size + raise_size);
-            table.hand.p1_pot += (call_size + raise_size);
-        }
-        // update table storage
         storage.tables.at(table_id).write(table);
     }
 
