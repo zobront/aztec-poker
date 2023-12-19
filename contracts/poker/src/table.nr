@@ -1,3 +1,6 @@
+// Overall, this code is to manage the state and actions of a gaming table, dealing with betting, player stacks, pot distribution, 
+// and other game-related functionalities. The serialization/deserialization aspect appears to be a work in progress.
+
 mod hand;
 mod percentage;
 
